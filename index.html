@@ -69,7 +69,7 @@
     </div>
 
     <div class="status-panel" id="statusPanel">
-        <div id="detectorInfo" style="font-size: 0.8rem; color: #03DAC6; font-weight: bold; margin-bottom: 10px;">⚡ エンジン: カスタム jsQR (自動フォールバック版)</div>
+        <div id="detectorInfo" style="font-size: 0.8rem; color: #03DAC6; font-weight: bold; margin-bottom: 10px;">⚡ エンジン: カスタム jsQR (高度トラッキング版)</div>
         <div class="qr-result qr-1">
             <strong>1個目:</strong> <span id="text1">未検出</span><br>
             <span style="font-size: 0.85em; color: #ccc;">管理部16bit: <span id="mg1">--</span></span>
@@ -148,12 +148,87 @@
         return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
     }
 
-    function estimateQrSize(item) {
-        if (item && item.points && item.points.length >= 2) {
-            return getDistance(item.points[0], item.points[1]);
+    // ▼▼▼ お客様考案のトラッキングアルゴリズム ▼▼▼
+    function processDetections(items) {
+        if (items.length === 0) return;
+
+        if (items.length >= 2) {
+            if (!firstQR) {
+                firstQR = items[0];
+                secondQR = items[1];
+                updateUI();
+                return;
+            }
+            if (firstQR && !secondQR) {
+                const dist0 = getDistance(firstQR.center, items[0].center);
+                const dist1 = getDistance(firstQR.center, items[1].center);
+                if (dist0 > dist1) {
+                    secondQR = items[0];
+                    firstQR = items[1]; 
+                } else {
+                    secondQR = items[1];
+                    firstQR = items[0]; 
+                }
+                updateUI();
+                return;
+            }
+            // ★追加：すでに両方ある状態でカメラが動いた場合、近い方に追従させる
+            if (firstQR && secondQR) {
+                const dist00 = getDistance(firstQR.center, items[0].center);
+                const dist01 = getDistance(firstQR.center, items[1].center);
+                if (dist00 < dist01) {
+                    firstQR.points = items[0].points; firstQR.center = items[0].center; if (items[0].text) firstQR.text = items[0].text;
+                    secondQR.points = items[1].points; secondQR.center = items[1].center; if (items[1].text) secondQR.text = items[1].text;
+                } else {
+                    firstQR.points = items[1].points; firstQR.center = items[1].center; if (items[1].text) firstQR.text = items[1].text;
+                    secondQR.points = items[0].points; secondQR.center = items[0].center; if (items[0].text) secondQR.text = items[0].text;
+                }
+                updateUI();
+                return;
+            }
         }
-        return 0;
+
+        if (items.length === 1) {
+            const item = items[0];
+            
+            if (!firstQR) {
+                firstQR = item;
+                updateUI();
+            } else if (!secondQR) {
+                // 生データ（textがnull）の場合、またはテキストが違う場合は第2QRとみなす
+                if ((item.text && firstQR.text && item.text !== firstQR.text) || (!item.text && firstQR.text)) {
+                    secondQR = item;
+                    updateUI();
+                } else {
+                    const dist = getDistance(firstQR.center, item.center);
+                    const qrSize = getDistance(item.points[0], item.points[1]);
+                    
+                    const distanceThreshold = Math.min(overlayCanvas.width * 0.1, qrSize * 0.45);
+
+                    if (dist > distanceThreshold) {
+                        secondQR = item;
+                        updateUI();
+                    } else {
+                        firstQR.points = item.points;
+                        firstQR.center = item.center;
+                        // 生データから復号された際にテキストも更新する
+                        if (item.text) firstQR.text = item.text;
+                        if (item.managementCode !== undefined) firstQR.managementCode = item.managementCode;
+                    }
+                }
+            } else {
+                // ★追加：両方ある状態で1つしか画面に映らなくなった場合、近い方の枠を更新する
+                const dist1 = getDistance(firstQR.center, item.center);
+                const dist2 = getDistance(secondQR.center, item.center);
+                if (dist1 < dist2) {
+                    firstQR.points = item.points; firstQR.center = item.center; if (item.text) firstQR.text = item.text;
+                } else {
+                    secondQR.points = item.points; secondQR.center = item.center; if (item.text) secondQR.text = item.text;
+                }
+            }
+        }
     }
+    // ▲▲▲ トラッキングアルゴリズム終了 ▲▲▲
 
     // --- カメラ起動処理 ---
     async function startApp() {
@@ -199,7 +274,7 @@
         }
     }
 
-    // ▼▼▼ 新しいアルゴリズムに準拠したスキャンループ ▼▼▼
+    // ▼▼▼ スキャンループ ▼▼▼
     async function scanLoop() {
         if (!isScanning) return;
 
@@ -225,97 +300,60 @@
                 zxingCtx.drawImage(video, 0, 0, zxingCanvas.width, zxingCanvas.height);
                 const imageData = zxingCtx.getImageData(0, 0, zxingCanvas.width, zxingCanvas.height);
 
-                // 【抽出】jsQRが自動でデコードし、成功・失敗データを両方返してくる
-                const scannedItems = jsQR(imageData.data, imageData.width, imageData.height, { 
+                // 【抽出】jsQRが自動でデコードし、成功・失敗（生データ）を両方返してくる
+                const rawItems = jsQR(imageData.data, imageData.width, imageData.height, { 
                     inversionAttempts: "attemptBoth", 
-                    multi: true // extractRawOnlyは不要になりました！
+                    multi: true 
                 });
 
-                if (scannedItems && scannedItems.length > 0) {
-                    let foundDecoded = [];
-                    let failedRaw = [];
+                if (rawItems && rawItems.length > 0) {
+                    let detectionItems = [];
 
-                    // 【第1QRの確定＆仕分け】
-                    for (const item of scannedItems) {
-                        const pts = getPts(item);
+                    // ① すべてのデータを統一フォーマットに変換する
+                    for (const raw of rawItems) {
+                        let decoded = jsQR.resumeDecode(raw, null);
+
+                        // パスワード入力済みなら暗号解除を試みる
+                        if (!decoded && appMask && (!secondQR || !secondQR.text)) {
+                            decoded = jsQR.resumeDecode(raw, Array.from(appMask));
+                        }
+
+                        const pts = getPts(raw);
                         const center = getCenter(pts);
 
-                        // item.data が存在すればデコード成功（第1QR候補）
-                        if (item.data) {
-                            foundDecoded.push({ 
-                                text: item.data, 
-                                managementCode: item.managementCode, 
-                                points: pts, 
-                                center: center, 
-                                raw: item.raw 
-                            });
-                        } 
-                        // item.data が無いが、item.raw がある場合はデコード失敗（第2QR候補）
-                        else if (item.raw) {
-                            // ※すでにパスワードが入力されている場合の継続処理（再スキャン用）
-                            if (appMask && !secondQR) {
-                                let decodedWithKey = jsQR.resumeDecode(item.raw, Array.from(appMask));
-                                if (decodedWithKey) {
-                                    secondQR = { text: decodedWithKey.text, managementCode: decodedWithKey.managementCode, points: pts, center: center };
-                                    updateUI();
-                                    continue; // 成功したらfailedRawには入れない
-                                }
-                            }
-                            // 暗号解除前、または解除失敗なら、生データリストに入れる
-                            failedRaw.push({ points: pts, center: center, raw: item.raw });
+                        if (decoded) {
+                            detectionItems.push({ text: decoded.text, managementCode: decoded.managementCode, points: pts, center: center, raw: raw });
+                        } else {
+                            // デコード失敗（生データ）の場合は text を null にして入れる
+                            detectionItems.push({ text: null, points: pts, center: center, raw: raw });
                         }
                     }
 
-                    // 成功したものを firstQR にセット（位置情報も更新）
-                    for (const item of foundDecoded) {
-                        if (!firstQR) {
-                            firstQR = item;
-                            updateUI();
-                        } else if (firstQR.text === item.text) {
-                            firstQR.points = item.points;
-                            firstQR.center = item.center;
-                        }
-                    }
+                    // 確実にテキストがあるもの（第1QR）を優先的に processDetections に渡すためのソート
+                    detectionItems.sort((a, b) => (b.text ? 1 : 0) - (a.text ? 1 : 0));
 
-                    // 【条件チェック】firstQRが見つかっており、まだパスワード未入力の場合
-                    if (firstQR && !appPassword && !secondQR) {
+                    // ② トラッキングロジックを実行！
+                    processDetections(detectionItems);
+
+                    // ③ パスワード画面の呼び出し判定（トラッキング後にチェック）
+                    if (firstQR && secondQR && !appPassword) {
                         const mgmtStr = firstQR.managementCode !== undefined ? 
                                         firstQR.managementCode.toString(2).padStart(16, '0') : "0000000000000000";
                         
-                        // 管理コードに「アプリ暗号化ビット（8ビット目）」が立っているか確認
-                        if (mgmtStr[7] === '1') {
+                        // 第1QRに暗号化ビットが立っていて、かつ第2QRがまだ未解読（生データ）なら
+                        if (mgmtStr[7] === '1' && !secondQR.text) {
+                            savedRawCandidates = [secondQR.raw]; // 第2QRの生データを保存
                             
-                            // 【第2QRの認定】デコードに失敗した生データの中から条件を満たすものを探す
-                            const size1 = estimateQrSize(firstQR);
-                            let validSecondCandidate = null;
-
-                            for (const cand of failedRaw) {
-                                const size2 = estimateQrSize(cand);
-                                const dist = getDistance(firstQR.center, cand.center);
-
-                                // 条件1: firstQR とサイズがほぼ同じ（0.5倍〜2.0倍の範囲）
-                                if (size2 < size1 * 0.5 || size2 > size1 * 2.0) continue;
-
-                                // 条件2: firstQR と中心点が完全に同じではない（サイズの半分以上は離れている）
-                                if (dist < size1 * 0.5) continue;
-
-                                // 条件3: firstQR の中心点から一定の距離内（サイズの4倍以内など、すぐそばにある）
-                                if (dist > size1 * 4.0) continue;
-
-                                // 条件をクリア！これが暗号化された第2QRの生データだ
-                                validSecondCandidate = cand;
-                                break; 
+                            // 一旦 secondQR を未確定に戻してパスワード画面を出す
+                            secondQR = null; 
+                            if (document.getElementById('passwordScreen').style.display !== 'flex') {
+                                showPasswordScreen();
+                                isProcessing = false;
+                                return; // ループを停止してパスワード入力を待つ
                             }
-
-                            // 【パスワード入力へ】条件を満たした生データが見つかった場合
-                            if (validSecondCandidate) {
-                                savedRawCandidates = [validSecondCandidate.raw]; 
-                                if (document.getElementById('passwordScreen').style.display !== 'flex') {
-                                    showPasswordScreen();
-                                    isProcessing = false;
-                                    return; // ループを停止してパスワード入力を待つ
-                                }
-                            }
+                        } else if (mgmtStr[7] !== '1' && !secondQR.text) {
+                            // 暗号化ビットがないのに未解読のゴミを拾ってしまった場合はリセット
+                            secondQR = null;
                         }
                     }
                 }
@@ -326,7 +364,7 @@
         }
 
         // 両方のQRが解読完了したら結果画面へ
-        if (firstQR && secondQR) {
+        if (firstQR && secondQR && firstQR.text && secondQR.text) {
             showResultScreen();
             isScanning = false;
             return;
@@ -385,16 +423,17 @@
 
     function updateUI() {
         if (firstQR) {
-            document.getElementById('text1').innerText = firstQR.text;
+            document.getElementById('text1').innerText = firstQR.text || "未検出";
             document.getElementById('mg1').innerText = firstQR.managementCode !== undefined ? firstQR.managementCode.toString(2).padStart(16, '0') : "なし";
         }
         if (secondQR) {
-            document.getElementById('text2').innerText = secondQR.text;
+            document.getElementById('text2').innerText = secondQR.text || "未検出";
             document.getElementById('mg2').innerText = secondQR.managementCode !== undefined ? secondQR.managementCode.toString(2).padStart(16, '0') : "なし";
         }
     }
 
     function formatResultText(text) {
+        if (!text) return "";
         if (/^https?:\/\//i.test(text)) {
             return `<a href="${text}" target="_blank" rel="noopener noreferrer" style="color: #03DAC6; text-decoration: underline; font-weight: bold;">${text}</a>`;
         }
